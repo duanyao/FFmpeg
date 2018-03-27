@@ -26,6 +26,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
+#include "libavutil/time.h"
 
 #include "libavcodec/internal.h"
 
@@ -1169,6 +1170,9 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
                              const uint8_t *payload, int payload_size,
                              int64_t pts, int64_t dts, int key, int stream_id)
 {
+    int64_t t0 = av_gettime(), tio = 0, tEnd = 0;
+    av_log(s, AV_LOG_WARNING, "mpegts_write_pes:start.\n");
+
     MpegTSWriteStream *ts_st = st->priv_data;
     MpegTSWrite *ts = s->priv_data;
     uint8_t buf[TS_PACKET_SIZE];
@@ -1422,9 +1426,15 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
         payload      += len;
         payload_size -= len;
         mpegts_prefix_m2ts_header(s);
+        int64_t tio_0 = av_gettime();
         avio_write(s->pb, buf, TS_PACKET_SIZE);
+        tio += av_gettime() - tio_0;
     }
     ts_st->prev_payload_key = key;
+
+    tEnd = av_gettime();
+    av_log(s, AV_LOG_WARNING, "mpegts_write_pes:end:used_time:%.4f, io_time:%.4f\n",
+        (tEnd - t0)/ 1000000.0, tio/ 1000000.0);
 }
 
 int ff_check_h264_startcode(AVFormatContext *s, const AVStream *st, const AVPacket *pkt)
@@ -1513,6 +1523,8 @@ static int opus_get_packet_samples(AVFormatContext *s, AVPacket *pkt)
 
 static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
 {
+    const int64_t t0 = av_gettime(), pts0 = pkt->pts;
+
     AVStream *st = s->streams[pkt->stream_index];
     int size = pkt->size;
     uint8_t *buf = pkt->data;
@@ -1765,7 +1777,8 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
                          pkt->flags & AV_PKT_FLAG_KEY, stream_id);
         ts_st->opus_queued_samples = 0;
         av_free(data);
-        return 0;
+        //return 0;
+        goto ok_end;
     }
 
     if (!ts_st->payload_size) {
@@ -1779,6 +1792,11 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
     ts_st->opus_queued_samples += opus_samples;
 
     av_free(data);
+
+ok_end:
+    int64_t tEnd = av_gettime();
+    av_log(s, AV_LOG_DEBUG, "mpegts_write_packet_internal:pts:%.3f, used time:%.4f\n",
+        pts0 / 1000000.0, (tEnd - t0) / 1000000.0);
 
     return 0;
 }

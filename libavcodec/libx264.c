@@ -26,6 +26,7 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/stereo3d.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/time.h"
 #include "avcodec.h"
 #include "internal.h"
 
@@ -39,6 +40,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static int frame_sn = 0;
 
 typedef struct X264Context {
     AVClass        *class;
@@ -271,6 +274,10 @@ static void reconfig_encoder(AVCodecContext *ctx, const AVFrame *frame)
 static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
                       int *got_packet)
 {
+    int64_t t0 = av_gettime();
+
+    av_log(ctx, AV_LOG_DEBUG, "X264_frame[sn=%04d]: start.", frame_sn);
+
     X264Context *x4 = ctx->priv_data;
     x264_nal_t *nal;
     int nnal, i, ret;
@@ -381,6 +388,11 @@ FF_ENABLE_DEPRECATION_WARNINGS
 #endif
     }
 
+    int64_t pts_in = frame? frame->pts : 0, tEnd = av_gettime();
+    av_log(ctx, AV_LOG_DEBUG, "X264_frame[sn=%04d]:finished. pts_in:%.3f, pts_out:%.3f, time_used:%3f\n",
+        frame_sn, pts_in / 1000000.0, pkt->pts / 1000000.0, (tEnd - t0) / 1000000.0);
+    frame_sn++;
+
     *got_packet = ret;
     return 0;
 }
@@ -455,6 +467,8 @@ static int convert_pix_fmt(enum AVPixelFormat pix_fmt)
 
 static av_cold int X264_init(AVCodecContext *avctx)
 {
+    frame_sn = 0;
+
     X264Context *x4 = avctx->priv_data;
     AVCPBProperties *cpb_props;
     int sw,sh;

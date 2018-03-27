@@ -64,6 +64,12 @@ struct gdigrab {
     HWND       region_hwnd; /**< Handle of the region border window */
 
     int cursor_error_printed;
+
+    int        sn;
+    int64_t    sync_point;
+
+    int fps_counter;
+    int64_t fps_time0;
 };
 
 #define WIN32_API_ERROR(str)                                            \
@@ -243,6 +249,11 @@ gdigrab_read_header(AVFormatContext *s1)
     RECT clip_rect;
     BITMAP bmp;
     int ret;
+
+    gdigrab->sn = 0;
+    gdigrab->sync_point = 0;
+    gdigrab->fps_counter = 0;
+    gdigrab->fps_time0 = 0;
 
     if (!strncmp(filename, "title=", 6)) {
         name = filename + 6;
@@ -522,6 +533,8 @@ icon_error:
  */
 static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
 {
+    const int64_t t0 = av_gettime();
+
     struct gdigrab *gdigrab = s1->priv_data;
 
     HDC        dest_hdc   = gdigrab->dest_hdc;
@@ -553,16 +566,24 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
             break;
         }
         if (s1->flags & AVFMT_FLAG_NONBLOCK) {
+            av_log(s1, AV_LOG_DEBUG,
+               "gdigrab_read_packet[sn=%04d]: EAGAIN, delay:%.3f.\n", gdigrab->sn, delay / 1000000.0);
             return AVERROR(EAGAIN);
         } else {
+            av_log(s1, AV_LOG_DEBUG,
+               "gdigrab_read_packet[sn=%04d]: sleep for delay:%.3f.\n", gdigrab->sn, delay / 1000000.0);
             av_usleep(delay);
         }
     }
+
+    av_log(s1, AV_LOG_DEBUG,
+               "gdigrab_read_packet[sn=%04d]: start.\n", gdigrab->sn);
 
     if (av_new_packet(pkt, file_size) < 0)
         return AVERROR(ENOMEM);
     pkt->pts = curtime;
 
+    const int64_t t1 = av_gettime();
     /* Blit screen grab */
     if (!BitBlt(dest_hdc, 0, 0,
                 clip_rect.right - clip_rect.left,
@@ -572,6 +593,11 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
         WIN32_API_ERROR("Failed to capture image");
         return AVERROR(EIO);
     }
+
+    const int64_t t2 = av_gettime();
+    if (gdigrab->sync_point == 0)
+        gdigrab->sync_point = t2;
+
     if (gdigrab->draw_mouse)
         paint_mouse_pointer(s1, gdigrab);
 
@@ -594,6 +620,24 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
     memcpy(pkt->data + gdigrab->header_size, gdigrab->buffer, gdigrab->frame_size);
 
     gdigrab->time_frame = time_frame;
+    int64_t tEnd = av_gettime();
+
+    const double tick = (1.0 / 60), totalDiff = (t1 - gdigrab->sync_point) / 1000000.0;
+    double syncDiff = totalDiff - round(totalDiff / tick) * tick;
+
+    av_log(s1, AV_LOG_DEBUG,
+               "gdigrab_read_packet[sn=%04d]: finished, pts:%08.3f, total time:%.3f, grab time:%.3f, syncDiff:%.3f.\n",
+               gdigrab->sn, pkt->pts / 1000000.0, (tEnd - t0) / 1000000.0, (t2 - t1) / 1000000.0, syncDiff);
+
+    gdigrab->sn++;
+
+    gdigrab->fps_counter++;
+	if (tEnd - gdigrab->fps_time0 >= 1000000) {
+		double fps = gdigrab->fps_counter / ((tEnd - gdigrab->fps_time0) / 1000000.0);
+		av_log(s1, AV_LOG_INFO, "gdigrab_read_packet:FPS:%.1f\n", fps);
+		gdigrab->fps_time0 = t0;
+		gdigrab->fps_counter = 1;
+	}
 
     return gdigrab->header_size + gdigrab->frame_size;
 }

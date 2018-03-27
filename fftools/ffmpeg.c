@@ -771,7 +771,7 @@ static void write_packet(OutputFile *of, AVPacket *pkt, OutputStream *ost, int u
             int64_t max = ost->last_mux_dts + !(s->oformat->flags & AVFMT_TS_NONSTRICT);
             if (pkt->dts < max) {
                 int loglevel = max - pkt->dts > 2 || st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO ? AV_LOG_WARNING : AV_LOG_DEBUG;
-                av_log(s, loglevel, "Non-monotonous DTS in output stream "
+                av_log(s, loglevel, "ffmpeg.c:Non-monotonous DTS in output stream "
                        "%d:%d; previous: %"PRId64", current: %"PRId64"; ",
                        ost->file_index, ost->st->index, ost->last_mux_dts, pkt->dts);
                 if (exit_on_error) {
@@ -4099,6 +4099,8 @@ static int get_input_packet_mt(InputFile *f, AVPacket *pkt)
 
 static int get_input_packet(InputFile *f, AVPacket *pkt)
 {
+    int64_t t0 = av_gettime();
+    av_log(NULL, AV_LOG_DEBUG, "get_input_packet:start.\n");
     if (f->rate_emu) {
         int i;
         for (i = 0; i < f->nb_streams; i++) {
@@ -4115,6 +4117,7 @@ static int get_input_packet(InputFile *f, AVPacket *pkt)
         return get_input_packet_mt(f, pkt);
 #endif
     return av_read_frame(f->ctx, pkt);
+    av_log(NULL, AV_LOG_DEBUG, "get_input_packet:end, time_used:%.3f.\n", (av_gettime() - t0)/1000000.0);
 }
 
 static int got_eagain(void)
@@ -4222,6 +4225,7 @@ static int seek_to_start(InputFile *ifile, AVFormatContext *is)
  */
 static int process_input(int file_index)
 {
+
     InputFile *ifile = input_files[file_index];
     AVFormatContext *is;
     InputStream *ist;
@@ -4229,6 +4233,9 @@ static int process_input(int file_index)
     int ret, i, j;
     int64_t duration;
     int64_t pkt_dts;
+
+    int64_t t0 = av_gettime();
+    av_log(NULL, AV_LOG_DEBUG, "process_input:start.\n");
 
     is  = ifile->ctx;
     ret = get_input_packet(ifile, &pkt);
@@ -4473,6 +4480,8 @@ static int process_input(int file_index)
 
 discard_packet:
     av_packet_unref(&pkt);
+
+    av_log(NULL, AV_LOG_DEBUG, "process_input:finish, time_used:%.3f.\n", (av_gettime() - t0) / 1000000.0);
 
     return 0;
 }

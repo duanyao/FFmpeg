@@ -21,6 +21,7 @@
  */
 
 #include "libavutil/intreadwrite.h"
+#include "libavutil/time.h"
 
 #include "avformat.h"
 #include "rawenc.h"
@@ -28,7 +29,10 @@
 
 int ff_raw_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
+    int64_t t0 = av_gettime();
+    av_log(s, AV_LOG_DEBUG, "ff_raw_write_packet:start\n");
     avio_write(s->pb, pkt->data, pkt->size);
+    av_log(s, AV_LOG_DEBUG, "ff_raw_write_packet:end, time_used: %.3f\n", (av_gettime() / 1000000));
     return 0;
 }
 

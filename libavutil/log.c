@@ -26,6 +26,8 @@
 
 #include "config.h"
 
+#include <windows.h>
+
 #if HAVE_UNISTD_H
 #include <unistd.h>
 #endif
@@ -40,6 +42,7 @@
 #include "internal.h"
 #include "log.h"
 #include "thread.h"
+#include "time.h"
 
 static AVMutex mutex = AV_MUTEX_INITIALIZER;
 
@@ -251,6 +254,13 @@ static void format_line(void *avcl, int level, const char *fmt, va_list vl,
     av_bprint_init(part+1, 0, 1);
     av_bprint_init(part+2, 0, 1);
     av_bprint_init(part+3, 0, 65536);
+
+    int64_t now = av_gettime();
+    // double now = clock() - timeBase;
+    // TODO mingw ignore 09 part? 
+    //  http://www.c4learn.com/c-programming/c-padding-zero/
+    //av_bprintf(part+0, "<%09.3f>", now/CLOCKS_PER_SEC);
+    av_bprintf(part+0, "<%09.3f>[tid:%d]", now / 1000000.0, (int)GetCurrentThreadId());
 
     if(type) type[0] = type[1] = AV_CLASS_CATEGORY_NA + 16;
     if (*print_prefix && avc) {
