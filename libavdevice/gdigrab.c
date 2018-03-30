@@ -32,6 +32,7 @@
 #include "libavformat/internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
+#include "libavutil/thread.h"
 #include <windows.h>
 
 /**
@@ -42,8 +43,8 @@ struct gdigrab {
 
     int        frame_size;  /**< Size in bytes of the frame pixel data */
     int        header_size; /**< Size in bytes of the DIB header */
-    AVRational time_base;   /**< Time base */
-    int64_t    time_frame;  /**< Current time */
+    int64_t    time_base;   /**< Period of frames (1/framerate) in us */
+    int64_t    time_frame;  /**< Time of current/last frame in us */
 
     int        draw_mouse;  /**< Draw mouse cursor (private option) */
     int        show_region; /**< Draw border (private option) */
@@ -57,13 +58,20 @@ struct gdigrab {
     HDC        source_hdc;  /**< Source device context */
     HDC        dest_hdc;    /**< Destination, source-compatible DC */
     BITMAPINFO bmi;         /**< Information describing DIB format */
-    HBITMAP    hbmp;        /**< Information on the bitmap captured */
-    void      *buffer;      /**< The buffer containing the bitmap image data */
+    HBITMAP    hbmp[2];     /**< Information on the bitmap captured */
+    void      *buffer[2];   /**< The buffer containing the bitmap image data */
     RECT       clip_rect;   /**< The subarea of the screen or window to clip */
 
     HWND       region_hwnd; /**< Handle of the region border window */
 
     int cursor_error_printed;
+
+    pthread_t       grab_thread;      /**< Worker thread for grabbing */
+    pthread_cond_t  grab_cond;        /**< Signal between the worker and main thread */
+    pthread_mutex_t grab_mutex;       /**< Lock of this struct gdigrab */
+    int             grab_worker_quit; /**< Boolean, instruct the worker to quit */
+    void           *frame_in_stock;   /**< The buffer contains a frame to be consumed */
+    int             error_code;       /**< Non-zero: a fatal error happened in the worker thread */
 };
 
 #define WIN32_API_ERROR(str)                                            \
@@ -179,12 +187,10 @@ error:
 
 /**
  * Cleanup/free the region outline window.
- *
- * @param s1 The format context.
  * @param gdigrab gdigrab context.
  */
 static void
-gdigrab_region_wnd_destroy(AVFormatContext *s1, struct gdigrab *gdigrab)
+gdigrab_region_wnd_destroy(struct gdigrab *gdigrab)
 {
     if (gdigrab->region_hwnd)
         DestroyWindow(gdigrab->region_hwnd);
@@ -198,11 +204,10 @@ gdigrab_region_wnd_destroy(AVFormatContext *s1, struct gdigrab *gdigrab)
  * unresponsive. As well, things like WM_PAINT (to actually draw the window
  * contents) are handled from the message queue context.
  *
- * @param s1 The format context.
  * @param gdigrab gdigrab context.
  */
 static void
-gdigrab_region_wnd_update(AVFormatContext *s1, struct gdigrab *gdigrab)
+gdigrab_region_wnd_update(struct gdigrab *gdigrab)
 {
     HWND hwnd = gdigrab->region_hwnd;
     MSG msg;
@@ -213,26 +218,73 @@ gdigrab_region_wnd_update(AVFormatContext *s1, struct gdigrab *gdigrab)
 }
 
 /**
- * Initializes the gdi grab device demuxer (public device demuxer API).
+ * Destroy condition variable and mutex.
+ *
+ * @param gdigrab gdigrab context.
+ * @return non-zero error, 0 success
+ */
+static int gdigrab_cond_destroy(struct gdigrab *gdigrab)
+{
+    pthread_mutex_destroy(&gdigrab->grab_mutex);
+    pthread_cond_destroy(&gdigrab->grab_cond);
+    return 0;
+}
+
+/**
+ * Destroy the Win32 windows, device contexts and bitmaps, if any.
+ *
+ * @param gdigrab gdigrab context.
+ * @return non-zero error, 0 success
+ */
+static int gdigrab_dc_destroy(struct gdigrab *gdigrab)
+{
+    if (gdigrab->show_region)
+        gdigrab_region_wnd_destroy(gdigrab);
+
+    if (gdigrab->source_hdc)
+        ReleaseDC(gdigrab->hwnd, gdigrab->source_hdc);
+    if (gdigrab->dest_hdc)
+        DeleteDC(gdigrab->dest_hdc);
+    if (gdigrab->source_hdc)
+        DeleteDC(gdigrab->source_hdc);
+
+    for(int i = 0; i < 2; i++) {
+        if (gdigrab->hbmp[i]) {
+            DeleteObject(gdigrab->hbmp[i]);
+            gdigrab->hbmp[i] = NULL;
+            gdigrab->buffer[i] = NULL;
+        }
+    }
+
+    gdigrab->hwnd = NULL;
+    gdigrab->source_hdc = NULL;
+    gdigrab->dest_hdc = NULL;
+    gdigrab->frame_in_stock = NULL;
+
+    return 0;
+}
+
+/**
+ * Initializes the Win32 windows, device contexts and bitmaps.
  *
  * @param s1 Context from avformat core
+ * @param gdigrab gdigrab context.
  * @return AVERROR_IO error, 0 success
  */
-static int
-gdigrab_read_header(AVFormatContext *s1)
+static int gdigrab_dc_init(AVFormatContext *s1, struct gdigrab *gdigrab)
 {
-    struct gdigrab *gdigrab = s1->priv_data;
+    pthread_mutex_lock(&gdigrab->grab_mutex);
+    av_log(s1, AV_LOG_TRACE, "gdigrab_dc_init: start, locked.\n");
 
-    HWND hwnd;
+    gdigrab_dc_destroy(gdigrab);
+
+    HWND hwnd = NULL;
     HDC source_hdc = NULL;
     HDC dest_hdc   = NULL;
     BITMAPINFO bmi;
-    HBITMAP hbmp   = NULL;
-    void *buffer   = NULL;
 
     const char *filename = s1->url;
     const char *name     = NULL;
-    AVStream   *st       = NULL;
 
     int bpp;
     int horzres;
@@ -242,38 +294,36 @@ gdigrab_read_header(AVFormatContext *s1)
     RECT virtual_rect;
     RECT clip_rect;
     BITMAP bmp;
-    int ret;
+    int ret = 0;
 
     if (!strncmp(filename, "title=", 6)) {
         name = filename + 6;
-        hwnd = FindWindow(NULL, name);
+        hwnd = gdigrab->hwnd = FindWindow(NULL, name);
         if (!hwnd) {
             av_log(s1, AV_LOG_ERROR,
                    "Can't find window '%s', aborting.\n", name);
             ret = AVERROR(EIO);
-            goto error;
+            goto end;
         }
         if (gdigrab->show_region) {
             av_log(s1, AV_LOG_WARNING,
                     "Can't show region when grabbing a window.\n");
             gdigrab->show_region = 0;
         }
-    } else if (!strcmp(filename, "desktop")) {
-        hwnd = NULL;
-    } else {
+    } else if (strcmp(filename, "desktop")) {
         av_log(s1, AV_LOG_ERROR,
                "Please use \"desktop\" or \"title=<windowname>\" to specify your target.\n");
         ret = AVERROR(EIO);
-        goto error;
+        goto end;
     }
 
     /* This will get the device context for the selected window, or if
      * none, the primary screen */
-    source_hdc = GetDC(hwnd);
+    source_hdc = gdigrab->source_hdc = GetDC(hwnd);
     if (!source_hdc) {
         WIN32_API_ERROR("Couldn't get window device context");
         ret = AVERROR(EIO);
-        goto error;
+        goto end;
     }
     bpp = GetDeviceCaps(source_hdc, BITSPIXEL);
 
@@ -315,7 +365,7 @@ gdigrab_read_header(AVFormatContext *s1)
                     virtual_rect.left, virtual_rect.top,
                     virtual_rect.right, virtual_rect.bottom);
             ret = AVERROR(EIO);
-            goto error;
+            goto end;
     }
 
 
@@ -338,14 +388,14 @@ gdigrab_read_header(AVFormatContext *s1)
             clip_rect.bottom - clip_rect.top <= 0 || bpp%8) {
         av_log(s1, AV_LOG_ERROR, "Invalid properties, aborting\n");
         ret = AVERROR(EIO);
-        goto error;
+        goto end;
     }
 
-    dest_hdc = CreateCompatibleDC(source_hdc);
+    dest_hdc = gdigrab->dest_hdc = CreateCompatibleDC(source_hdc);
     if (!dest_hdc) {
         WIN32_API_ERROR("Screen DC CreateCompatibleDC");
         ret = AVERROR(EIO);
-        goto error;
+        goto end;
     }
 
     /* Create a DIB and select it into the dest_hdc */
@@ -360,42 +410,26 @@ gdigrab_read_header(AVFormatContext *s1)
     bmi.bmiHeader.biYPelsPerMeter = 0;
     bmi.bmiHeader.biClrUsed       = 0;
     bmi.bmiHeader.biClrImportant  = 0;
-    hbmp = CreateDIBSection(dest_hdc, &bmi, DIB_RGB_COLORS,
-            &buffer, NULL, 0);
-    if (!hbmp) {
-        WIN32_API_ERROR("Creating DIB Section");
-        ret = AVERROR(EIO);
-        goto error;
-    }
 
-    if (!SelectObject(dest_hdc, hbmp)) {
-        WIN32_API_ERROR("SelectObject");
-        ret = AVERROR(EIO);
-        goto error;
+    for(int i = 0; i < 2; i++) {
+        gdigrab->hbmp[i] = CreateDIBSection(dest_hdc, &bmi, DIB_RGB_COLORS,
+            &gdigrab->buffer[i], NULL, 0);
+        if (!gdigrab->hbmp[i]) {
+            WIN32_API_ERROR("Creating DIB Section");
+            ret = AVERROR(EIO);
+            goto end;
+        }
     }
 
     /* Get info from the bitmap */
-    GetObject(hbmp, sizeof(BITMAP), &bmp);
-
-    st = avformat_new_stream(s1, NULL);
-    if (!st) {
-        ret = AVERROR(ENOMEM);
-        goto error;
-    }
-    avpriv_set_pts_info(st, 64, 1, 1000000); /* 64 bits pts in us */
+    GetObject(gdigrab->hbmp[0], sizeof(BITMAP), &bmp);
 
     gdigrab->frame_size  = bmp.bmWidthBytes * bmp.bmHeight * bmp.bmPlanes;
     gdigrab->header_size = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER) +
                            (bpp <= 8 ? (1 << bpp) : 0) * sizeof(RGBQUAD) /* palette size */;
-    gdigrab->time_base   = av_inv_q(gdigrab->framerate);
-    gdigrab->time_frame  = av_gettime() / av_q2d(gdigrab->time_base);
+    gdigrab->time_base   = (int64_t)(1000000.0 / av_q2d(gdigrab->framerate));
 
-    gdigrab->hwnd       = hwnd;
-    gdigrab->source_hdc = source_hdc;
-    gdigrab->dest_hdc   = dest_hdc;
-    gdigrab->hbmp       = hbmp;
     gdigrab->bmi        = bmi;
-    gdigrab->buffer     = buffer;
     gdigrab->clip_rect  = clip_rect;
 
     gdigrab->cursor_error_printed = 0;
@@ -403,27 +437,19 @@ gdigrab_read_header(AVFormatContext *s1)
     if (gdigrab->show_region) {
         if (gdigrab_region_wnd_init(s1, gdigrab)) {
             ret = AVERROR(EIO);
-            goto error;
+            goto end;
         }
     }
 
-    st->avg_frame_rate = av_inv_q(gdigrab->time_base);
+    av_log(s1, AV_LOG_TRACE, "gdigrab_dc_init: ok\n");
 
-    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codecpar->codec_id   = AV_CODEC_ID_BMP;
-    st->codecpar->bit_rate   = (gdigrab->header_size + gdigrab->frame_size) * 1/av_q2d(gdigrab->time_base) * 8;
+end:
+    if (ret)
+        gdigrab_dc_destroy(gdigrab);
 
-    return 0;
-
-error:
-    if (source_hdc)
-        ReleaseDC(hwnd, source_hdc);
-    if (dest_hdc)
-        DeleteDC(dest_hdc);
-    if (hbmp)
-        DeleteObject(hbmp);
-    if (source_hdc)
-        DeleteDC(source_hdc);
+    gdigrab->error_code = ret;
+    pthread_cond_broadcast(&gdigrab->grab_cond);
+    pthread_mutex_unlock(&gdigrab->grab_mutex);
     return ret;
 }
 
@@ -431,7 +457,7 @@ error:
  * Paints a mouse pointer in a Win32 image.
  *
  * @param s1 Context of the log information
- * @param s  Current grad structure
+ * @param gdigrab gdigrab context.
  */
 static void paint_mouse_pointer(AVFormatContext *s1, struct gdigrab *gdigrab)
 {
@@ -514,69 +540,205 @@ icon_error:
 }
 
 /**
- * Grabs a frame from gdi (public device demuxer API).
+ * Worker thread entry function.
  *
- * @param s1 Context from avformat core
- * @param pkt Packet holding the grabbed frame
- * @return frame size in bytes
+ * @param v AVFormatContext
  */
-static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
+static void * attribute_align_arg gdigrab_worker(void *v)
 {
+    AVFormatContext *s1 = v;
     struct gdigrab *gdigrab = s1->priv_data;
 
-    HDC        dest_hdc   = gdigrab->dest_hdc;
-    HDC        source_hdc = gdigrab->source_hdc;
-    RECT       clip_rect  = gdigrab->clip_rect;
-    AVRational time_base  = gdigrab->time_base;
-    int64_t    time_frame = gdigrab->time_frame;
+    av_log(s1, AV_LOG_TRACE, "gdigrab_worker: start.\n");
 
+    if (gdigrab_dc_init(s1, gdigrab))
+        goto end;
+
+    const HDC        dest_hdc   = gdigrab->dest_hdc;
+    const HDC        source_hdc = gdigrab->source_hdc;
+    const RECT       clip_rect  = gdigrab->clip_rect;
+    const int64_t    time_base  = gdigrab->time_base;
+
+    int64_t    time_start, time_grab_end, time_sleep_start, time_end,
+               time_sleep, time_request_sleep, time_actual_sleep,
+               sleep_balance = 0;
+    int        error = 0;
+    void      *frame_in_stock = NULL;
+
+    av_log(s1, AV_LOG_TRACE, "gdigrab_worker: time_base:%.3f.\n", time_base / 1000000.0);
+
+    time_end = av_gettime();
+    for(int i = 0, sn = 0; !gdigrab->grab_worker_quit; i = (i + 1) % 2, sn++) {
+        /* time_start of this frame is time_end of last frame */
+        time_start = time_end;
+        av_log(s1, AV_LOG_TRACE, "gdigrab_worker: sn:%04d, index:%d\n", sn, i);
+
+        /* Run Window message processing queue */
+        if (gdigrab->show_region)
+            gdigrab_region_wnd_update(gdigrab);
+        /* Blit screen grab */
+        if (!SelectObject(dest_hdc, gdigrab->hbmp[i])) {
+            WIN32_API_ERROR("SelectObject");
+            error = AVERROR(EIO);
+            frame_in_stock = NULL;
+        } else {
+            if (!BitBlt(dest_hdc, 0, 0,
+                        clip_rect.right - clip_rect.left,
+                        clip_rect.bottom - clip_rect.top,
+                        source_hdc,
+                        clip_rect.left, clip_rect.top, SRCCOPY | CAPTUREBLT)) {
+                WIN32_API_ERROR("Failed to capture image");
+                error = AVERROR(EIO);
+                frame_in_stock = NULL;
+            } else {
+                error = 0;
+                frame_in_stock = gdigrab->buffer[i];
+                if (gdigrab->draw_mouse)
+                    paint_mouse_pointer(s1, gdigrab);
+            }
+        }
+        time_grab_end = av_gettime();
+
+        pthread_mutex_lock(&gdigrab->grab_mutex);
+        /* Quit if error happened on first try */
+        if (error && sn == 0) {
+            gdigrab->error_code = error;
+            break;
+        }
+        if (gdigrab->grab_worker_quit)
+            break;
+
+        /* Wait for a frame being comsumed */
+        while(gdigrab->frame_in_stock) {
+            av_log(s1, AV_LOG_TRACE, "gdigrab_worker: wait frame_in_stock.\n");
+            pthread_cond_wait(&gdigrab->grab_cond, &gdigrab->grab_mutex);
+            av_log(s1, AV_LOG_TRACE, "gdigrab_worker: wait frame_in_stock continue.\n");
+        }
+
+        if (gdigrab->grab_worker_quit)
+            break;
+
+        gdigrab->time_frame = time_start;
+        gdigrab->frame_in_stock = frame_in_stock;
+        pthread_cond_broadcast(&gdigrab->grab_cond);
+        av_log(s1, AV_LOG_TRACE, "gdigrab_worker: a frame posted, sn:%04d\n", sn);
+        pthread_mutex_unlock(&gdigrab->grab_mutex);
+
+        /* sleep based on the frame rate */
+        time_sleep_start = av_gettime();
+        time_sleep = time_base - (time_sleep_start - time_start);
+        time_request_sleep = time_sleep + sleep_balance;
+        if (time_request_sleep > 0)
+            av_usleep(time_request_sleep);
+
+        time_end = av_gettime();
+        time_actual_sleep = time_end - time_sleep_start;
+        sleep_balance += time_sleep - time_actual_sleep;
+        /* restrict the minimum of sleep_balance */
+        if (sleep_balance < -time_base)
+            sleep_balance = -time_base;
+
+        av_log(s1, AV_LOG_DEBUG, "gdigrab_worker: a frame finished, sn:%04d, "
+            "time_used:%.3f, grab:%.3f, wait:%.3f, sleep:%.3f, balance:%.3f\n",
+            sn,
+            (time_end - time_start) / 1000000.0,
+            (time_grab_end - time_start) / 1000000.0,
+            (time_sleep_start - time_grab_end) / 1000000.0,
+            time_actual_sleep / 1000000.0,
+            sleep_balance / 1000000.0
+            );
+    }
+
+end:
+    av_log(s1, AV_LOG_TRACE, "gdigrab_worker: exiting.\n");
+    gdigrab_dc_destroy(gdigrab);
+    pthread_cond_broadcast(&gdigrab->grab_cond);
+    pthread_mutex_unlock(&gdigrab->grab_mutex);
+    gdigrab_cond_destroy(gdigrab);
+    return NULL;
+}
+
+/**
+ * Start the worker thread.
+ *
+ * @param v Context from avformat core
+ * @return AVERROR_IO error, 0 success
+ */
+static int gdigrab_worker_start(AVFormatContext *s1)
+{
+    av_log(s1, AV_LOG_TRACE, "gdigrab_worker_start\n");
+    struct gdigrab *gdigrab = s1->priv_data;
+
+    pthread_mutex_init(&gdigrab->grab_mutex, NULL);
+    pthread_cond_init(&gdigrab->grab_cond, NULL);
+    gdigrab->error_code = 0;
+
+    if (pthread_create(&gdigrab->grab_thread, NULL, gdigrab_worker, s1)) {
+        gdigrab_cond_destroy(gdigrab);
+        return AVERROR(EIO);
+    }
+    av_log(s1, AV_LOG_TRACE, "gdigrab_worker_start: pthread_create() ok.\n");
+
+    pthread_mutex_lock(&gdigrab->grab_mutex);
+    if (!gdigrab->error_code)
+        pthread_cond_wait(&gdigrab->grab_cond, &gdigrab->grab_mutex);
+    av_log(s1, AV_LOG_TRACE, "gdigrab_worker_start: error_code: %d.\n", gdigrab->error_code);
+    pthread_mutex_unlock(&gdigrab->grab_mutex);
+    return gdigrab->error_code;
+}
+
+/**
+ * Initializes the gdi grab device demuxer (public device demuxer API).
+ *
+ * @param s1 Context from avformat core
+ * @return AVERROR_IO error, 0 success
+ */
+static int gdigrab_read_header(AVFormatContext *s1)
+{
+    int ret;
+    struct gdigrab *gdigrab = s1->priv_data;
+    AVStream *st = avformat_new_stream(s1, NULL);
+    if (!st) {
+        ret = AVERROR(ENOMEM);
+        goto error;
+    }
+
+    if (gdigrab_worker_start(s1)) {
+        ret = AVERROR(EIO);
+        goto error;
+    }
+
+    avpriv_set_pts_info(st, 64, 1, 1000000); /* 64 bits pts in us */
+    st->avg_frame_rate = gdigrab->framerate;
+
+    st->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_id   = AV_CODEC_ID_BMP;
+    st->codecpar->bit_rate   = (gdigrab->header_size + gdigrab->frame_size) * av_q2d(gdigrab->framerate) * 8;
+
+    return 0;
+
+error:
+    return ret;
+}
+
+/**
+ * Copy a grabbed frame to a AVPacket.
+ *
+ * @param gdigrab gdigrab context.
+ * @param pkt Packet holding the grabbed frame
+ * @return no-zero error, 0 success
+ */
+static int gdigrab_copy_frame(struct gdigrab *gdigrab, AVPacket *pkt)
+{
     BITMAPFILEHEADER bfh;
     int file_size = gdigrab->header_size + gdigrab->frame_size;
 
-    int64_t curtime, delay;
-
-    /* Calculate the time of the next frame */
-    time_frame += INT64_C(1000000);
-
-    /* Run Window message processing queue */
-    if (gdigrab->show_region)
-        gdigrab_region_wnd_update(s1, gdigrab);
-
-    /* wait based on the frame rate */
-    for (;;) {
-        curtime = av_gettime();
-        delay = time_frame * av_q2d(time_base) - curtime;
-        if (delay <= 0) {
-            if (delay < INT64_C(-1000000) * av_q2d(time_base)) {
-                time_frame += INT64_C(1000000);
-            }
-            break;
-        }
-        if (s1->flags & AVFMT_FLAG_NONBLOCK) {
-            return AVERROR(EAGAIN);
-        } else {
-            av_usleep(delay);
-        }
-    }
-
     if (av_new_packet(pkt, file_size) < 0)
         return AVERROR(ENOMEM);
-    pkt->pts = curtime;
 
-    /* Blit screen grab */
-    if (!BitBlt(dest_hdc, 0, 0,
-                clip_rect.right - clip_rect.left,
-                clip_rect.bottom - clip_rect.top,
-                source_hdc,
-                clip_rect.left, clip_rect.top, SRCCOPY | CAPTUREBLT)) {
-        WIN32_API_ERROR("Failed to capture image");
-        return AVERROR(EIO);
-    }
-    if (gdigrab->draw_mouse)
-        paint_mouse_pointer(s1, gdigrab);
+    pkt->pts = gdigrab->time_frame;
 
     /* Copy bits to packet data */
-
     bfh.bfType = 0x4d42; /* "BM" in little-endian */
     bfh.bfSize = file_size;
     bfh.bfReserved1 = 0;
@@ -588,14 +750,50 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
     memcpy(pkt->data + sizeof(bfh), &gdigrab->bmi.bmiHeader, sizeof(gdigrab->bmi.bmiHeader));
 
     if (gdigrab->bmi.bmiHeader.biBitCount <= 8)
-        GetDIBColorTable(dest_hdc, 0, 1 << gdigrab->bmi.bmiHeader.biBitCount,
+        GetDIBColorTable(gdigrab->dest_hdc, 0, 1 << gdigrab->bmi.bmiHeader.biBitCount,
                 (RGBQUAD *) (pkt->data + sizeof(bfh) + sizeof(gdigrab->bmi.bmiHeader)));
 
-    memcpy(pkt->data + gdigrab->header_size, gdigrab->buffer, gdigrab->frame_size);
+    memcpy(pkt->data + gdigrab->header_size, gdigrab->frame_in_stock, gdigrab->frame_size);
 
-    gdigrab->time_frame = time_frame;
+    gdigrab->frame_in_stock = NULL;
 
     return gdigrab->header_size + gdigrab->frame_size;
+}
+
+/**
+ * Grabs a frame from gdi (public device demuxer API).
+ *
+ * @param s1 Context from avformat core
+ * @param pkt Packet holding the grabbed frame
+ * @return frame size in bytes
+ */
+static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
+{
+    av_log(s1, AV_LOG_TRACE, "gdigrab_read_packet: start.\n");
+    struct gdigrab *gdigrab = s1->priv_data;
+    int ret;
+    pthread_mutex_lock(&gdigrab->grab_mutex);
+    if (gdigrab->error_code) {
+        ret = AVERROR(EIO);
+    } else if (gdigrab->frame_in_stock) {
+        ret = gdigrab_copy_frame(gdigrab, pkt);
+    } else if (s1->flags & AVFMT_FLAG_NONBLOCK) {
+-       ret = AVERROR(EAGAIN);
+    } else {
+        av_log(s1, AV_LOG_TRACE, "gdigrab_read_packet: wait.\n");
+        pthread_cond_wait(&gdigrab->grab_cond, &gdigrab->grab_mutex);
+        av_log(s1, AV_LOG_TRACE, "gdigrab_read_packet: continue.\n");
+        if (gdigrab->frame_in_stock) {
+            ret = gdigrab_copy_frame(gdigrab, pkt);
+        } else {
+            ret = AVERROR(EIO);
+            av_log(s1, AV_LOG_ERROR, "gdigrab_read_packet: no captured image\n");
+        }
+    }
+    pthread_cond_broadcast(&gdigrab->grab_cond);
+    pthread_mutex_unlock(&gdigrab->grab_mutex);
+    av_log(s1, AV_LOG_TRACE, "gdigrab_read_packet: end.\n");
+    return ret;
 }
 
 /**
@@ -606,20 +804,11 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
  */
 static int gdigrab_read_close(AVFormatContext *s1)
 {
-    struct gdigrab *s = s1->priv_data;
-
-    if (s->show_region)
-        gdigrab_region_wnd_destroy(s1, s);
-
-    if (s->source_hdc)
-        ReleaseDC(s->hwnd, s->source_hdc);
-    if (s->dest_hdc)
-        DeleteDC(s->dest_hdc);
-    if (s->hbmp)
-        DeleteObject(s->hbmp);
-    if (s->source_hdc)
-        DeleteDC(s->source_hdc);
-
+    struct gdigrab *gdigrab = s1->priv_data;
+    pthread_mutex_lock(&gdigrab->grab_mutex);
+    gdigrab->grab_worker_quit = TRUE;
+    pthread_cond_broadcast(&gdigrab->grab_cond);
+    pthread_mutex_unlock(&gdigrab->grab_mutex);
     return 0;
 }
 
