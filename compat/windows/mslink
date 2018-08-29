@@ -1,9 +1,9 @@
 #!/bin/sh
 
-LINK_EXE_PATH=$(dirname "$(command -v cl)")/link
+LINK_EXE_PATH=$(dirname "$(command -v cl.exe)")/link.exe
 if [ -x "$LINK_EXE_PATH" ]; then
     "$LINK_EXE_PATH" $@
 else
-    link $@
+    link.exe $@
 fi
 exit $?
