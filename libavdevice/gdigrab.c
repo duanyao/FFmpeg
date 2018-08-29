@@ -35,6 +35,8 @@
 #include "libavutil/thread.h"
 #include <windows.h>
 
+#include "libavutil/uprofiler.h"
+
 /**
  * GDI Device Demuxer context
  */
@@ -72,6 +74,9 @@ struct gdigrab {
     int             grab_worker_quit; /**< Boolean, instruct the worker to quit */
     void           *frame_in_stock;   /**< The buffer contains a frame to be consumed */
     int             error_code;       /**< Non-zero: a fatal error happened in the worker thread */
+
+    void     *test_buffer;
+    void     *test_buffer1;
 };
 
 #define WIN32_API_ERROR(str)                                            \
@@ -441,6 +446,10 @@ static int gdigrab_dc_init(AVFormatContext *s1, struct gdigrab *gdigrab)
         }
     }
 
+    gdigrab->test_buffer = malloc(gdigrab->frame_size);
+    gdigrab->test_buffer1 = malloc(gdigrab->frame_size);
+    av_log(s1, AV_LOG_INFO, "gdigrab_dc_init: frame_size: %d\n", gdigrab->frame_size);
+
     av_log(s1, AV_LOG_TRACE, "gdigrab_dc_init: ok\n");
 
 end:
@@ -730,11 +739,15 @@ error:
  */
 static int gdigrab_copy_frame(struct gdigrab *gdigrab, AVPacket *pkt)
 {
+    PROFILE_START("gdigrab_copy_frame");
+
     BITMAPFILEHEADER bfh;
     int file_size = gdigrab->header_size + gdigrab->frame_size;
 
+    {PROFILE_START("gdigrab_copy_frame/av_new_packet")
     if (av_new_packet(pkt, file_size) < 0)
         return AVERROR(ENOMEM);
+    PROFILE_END}
 
     pkt->pts = gdigrab->time_frame;
 
@@ -749,13 +762,51 @@ static int gdigrab_copy_frame(struct gdigrab *gdigrab, AVPacket *pkt)
 
     memcpy(pkt->data + sizeof(bfh), &gdigrab->bmi.bmiHeader, sizeof(gdigrab->bmi.bmiHeader));
 
+    {PROFILE_START("gdigrab_copy_frame/GetDIBColorTable")
     if (gdigrab->bmi.bmiHeader.biBitCount <= 8)
         GetDIBColorTable(gdigrab->dest_hdc, 0, 1 << gdigrab->bmi.bmiHeader.biBitCount,
                 (RGBQUAD *) (pkt->data + sizeof(bfh) + sizeof(gdigrab->bmi.bmiHeader)));
+    PROFILE_END}
 
+    // {PROFILE_START("gdigrab_copy_frame/memcpy(test b/10)")
+    // memcpy(pkt->data + gdigrab->header_size, gdigrab->test_buffer, gdigrab->frame_size / 10);
+    // PROFILE_END}
+    // {PROFILE_START("gdigrab_copy_frame/memcpy(test b)")
+    // memcpy(pkt->data + gdigrab->header_size, gdigrab->test_buffer, gdigrab->frame_size);
+    // PROFILE_END}
+    // {PROFILE_START("gdigrab_copy_frame/memcpy(test c)")
+    // memcpy(gdigrab->test_buffer1, gdigrab->test_buffer, gdigrab->frame_size);
+    // PROFILE_END}
+    // {PROFILE_START("gdigrab_copy_frame/memcpy(test d)")
+    // memcpy(gdigrab->test_buffer1, gdigrab->frame_in_stock, gdigrab->frame_size);
+    // PROFILE_END}
+    // {PROFILE_START("gdigrab_copy_frame/memcpy(test e)")
+    // memcpy(gdigrab->test_buffer1, pkt->data + gdigrab->header_size, gdigrab->frame_size);
+    // PROFILE_END}
+
+
+    void * buf;
+    {PROFILE_START("gdigrab_copy_frame/malloc")
+    buf = malloc(gdigrab->frame_size);
+    PROFILE_END}
+    {PROFILE_START("gdigrab_copy_frame/memcpy(test f)")
+    memcpy(gdigrab->test_buffer1, buf, gdigrab->frame_size);
+    PROFILE_END}
+    free(buf);
+
+    {PROFILE_START("gdigrab_copy_frame/memcpy(frame)")
     memcpy(pkt->data + gdigrab->header_size, gdigrab->frame_in_stock, gdigrab->frame_size);
+    PROFILE_END}
+    // {PROFILE_START("gdigrab_copy_frame/memcpy(test c1)")
+    // memcpy(gdigrab->test_buffer1, gdigrab->test_buffer, gdigrab->frame_size);
+    // PROFILE_END}
+    // {PROFILE_START("gdigrab_copy_frame/memcpy(test a)")
+    // memcpy(gdigrab->test_buffer, pkt->data, gdigrab->frame_size);
+    // PROFILE_END}
 
     gdigrab->frame_in_stock = NULL;
+
+    PROFILE_END;
 
     return gdigrab->header_size + gdigrab->frame_size;
 }
@@ -769,6 +820,7 @@ static int gdigrab_copy_frame(struct gdigrab *gdigrab, AVPacket *pkt)
  */
 static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
 {
+    PROFILE_START("gdigrab_read_packet");
     av_log(s1, AV_LOG_TRACE, "gdigrab_read_packet: start.\n");
     struct gdigrab *gdigrab = s1->priv_data;
     int ret;
@@ -778,7 +830,9 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
     } else if (gdigrab->frame_in_stock) {
         ret = gdigrab_copy_frame(gdigrab, pkt);
     } else if (s1->flags & AVFMT_FLAG_NONBLOCK) {
--       ret = AVERROR(EAGAIN);
+        PROFILE_START("gdigrab_read_packet/EAGAIN");
+        ret = AVERROR(EAGAIN);
+        PROFILE_END;
     } else {
         av_log(s1, AV_LOG_TRACE, "gdigrab_read_packet: wait.\n");
         pthread_cond_wait(&gdigrab->grab_cond, &gdigrab->grab_mutex);
@@ -793,6 +847,7 @@ static int gdigrab_read_packet(AVFormatContext *s1, AVPacket *pkt)
     pthread_cond_broadcast(&gdigrab->grab_cond);
     pthread_mutex_unlock(&gdigrab->grab_mutex);
     av_log(s1, AV_LOG_TRACE, "gdigrab_read_packet: end.\n");
+    PROFILE_END;
     return ret;
 }
 

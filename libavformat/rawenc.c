@@ -20,6 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/uprofiler.h"
+
 #include "libavutil/intreadwrite.h"
 
 #include "avformat.h"
@@ -28,7 +30,9 @@
 
 int ff_raw_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
+    {PROFILE_START("ff_raw_write_packet");
     avio_write(s->pb, pkt->data, pkt->size);
+    PROFILE_END}
     return 0;
 }
 

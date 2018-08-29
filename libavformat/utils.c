@@ -22,6 +22,8 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+#include "libavutil/uprofiler.h"
+
 #include "config.h"
 
 #include "libavutil/avassert.h"
@@ -1542,6 +1544,7 @@ static int64_t ts_to_samples(AVStream *st, int64_t ts)
 
 static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
 {
+    PROFILE_START("read_frame_internal");
     int ret = 0, i, got_packet = 0;
     AVDictionary *metadata = NULL;
 
@@ -1554,8 +1557,10 @@ static int read_frame_internal(AVFormatContext *s, AVPacket *pkt)
         /* read next packet */
         ret = ff_read_packet(s, &cur_pkt);
         if (ret < 0) {
-            if (ret == AVERROR(EAGAIN))
+            if (ret == AVERROR(EAGAIN)) {
+                PROFILE_END;
                 return ret;
+            }
             /* flush the parsers */
             for (i = 0; i < s->nb_streams; i++) {
                 st = s->streams[i];
@@ -1734,7 +1739,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
                av_ts2str(pkt->pts),
                av_ts2str(pkt->dts),
                pkt->size, pkt->duration, pkt->flags);
-
+    PROFILE_END;
     return ret;
 }
 

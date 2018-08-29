@@ -25,6 +25,8 @@
 #include <errno.h>
 #include <math.h>
 
+#include "libavutil/uprofiler.h"
+
 /* Include only the enabled headers since some compilers (namely, Sun
    Studio) will not omit unused inline functions and create undefined
    references to libraries that are not being built. */
@@ -137,6 +139,8 @@ void exit_program(int ret)
 {
     if (program_exit)
         program_exit(ret);
+
+    uprofile_write_log_std(2);
 
     exit(ret);
 }

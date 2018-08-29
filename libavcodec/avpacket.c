@@ -19,6 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/uprofiler.h"
+
 #include <string.h>
 
 #include "libavutil/avassert.h"
@@ -591,9 +593,15 @@ FF_ENABLE_DEPRECATION_WARNINGS
 
 void av_packet_unref(AVPacket *pkt)
 {
+    {PROFILE_START("av_packet_unref/av_packet_free_side_data");
     av_packet_free_side_data(pkt);
+    PROFILE_END}
+    {PROFILE_START("av_packet_unref/av_buffer_unref");
     av_buffer_unref(&pkt->buf);
+    PROFILE_END}
+    {PROFILE_START("av_packet_unref/av_init_packet");
     av_init_packet(pkt);
+    PROFILE_END}
     pkt->data = NULL;
     pkt->size = 0;
 }

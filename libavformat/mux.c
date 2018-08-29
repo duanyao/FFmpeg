@@ -19,6 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/uprofiler.h"
+
 #include "avformat.h"
 #include "avio_internal.h"
 #include "internal.h"
@@ -673,6 +675,7 @@ FF_ENABLE_DEPRECATION_WARNINGS
  */
 static int write_packet(AVFormatContext *s, AVPacket *pkt)
 {
+    PROFILE_START(__FILE__ ":write_packet()")
     int ret;
     int64_t pts_backup, dts_backup;
 
@@ -757,7 +760,7 @@ static int write_packet(AVFormatContext *s, AVPacket *pkt)
         pkt->pts = pts_backup;
         pkt->dts = dts_backup;
     }
-
+    PROFILE_END
     return ret;
 }
 
@@ -1173,27 +1176,38 @@ int ff_interleaved_peek(AVFormatContext *s, int stream,
  */
 static int interleave_packet(AVFormatContext *s, AVPacket *out, AVPacket *in, int flush)
 {
+    
     if (s->oformat->interleave_packet) {
+        PROFILE_START("interleave_packet/1")
         int ret = s->oformat->interleave_packet(s, out, in, flush);
         if (in)
             av_packet_unref(in);
+        PROFILE_END
         return ret;
-    } else
-        return ff_interleave_packet_per_dts(s, out, in, flush);
+    } else {
+        PROFILE_START("interleave_packet/ff_interleave_packet_per_dts")
+        int ret = ff_interleave_packet_per_dts(s, out, in, flush);
+        PROFILE_END
+        return ret;
+    }
+    
 }
 
 int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt)
 {
+    
     int ret, flush = 0;
-
+    {PROFILE_START("av_interleaved_write_frame/prepare_input_packet")
     ret = prepare_input_packet(s, pkt);
+    PROFILE_END}
     if (ret < 0)
         goto fail;
 
     if (pkt) {
         AVStream *st = s->streams[pkt->stream_index];
-
+        {PROFILE_START("av_interleaved_write_frame/do_packet_auto_bsf")
         ret = do_packet_auto_bsf(s, pkt);
+        PROFILE_END}
         if (ret == 0)
             return 0;
         else if (ret < 0)
@@ -1204,8 +1218,10 @@ int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt)
                 pkt->size, av_ts2str(pkt->dts), av_ts2str(pkt->pts));
 
 #if FF_API_COMPUTE_PKT_FIELDS2 && FF_API_LAVF_AVCTX
+        {PROFILE_START("av_interleaved_write_frame/compute_muxer_pkt_fields")
         if ((ret = compute_muxer_pkt_fields(s, st, pkt)) < 0 && !(s->oformat->flags & AVFMT_NOTIMESTAMPS))
             goto fail;
+        PROFILE_END}
 #endif
 
         if (pkt->dts == AV_NOPTS_VALUE && !(s->oformat->flags & AVFMT_NOTIMESTAMPS)) {
@@ -1219,20 +1235,27 @@ int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt)
 
     for (;; ) {
         AVPacket opkt;
-        int ret = interleave_packet(s, &opkt, pkt, flush);
+        int ret;
+        {PROFILE_START("av_interleaved_write_frame/interleave_packet")
+        ret = interleave_packet(s, &opkt, pkt, flush);
+        PROFILE_END}
         if (pkt) {
+            PROFILE_START("av_interleaved_write_frame/av_init_packet+")
             memset(pkt, 0, sizeof(*pkt));
             av_init_packet(pkt);
             pkt = NULL;
+            PROFILE_END
         }
         if (ret <= 0) //FIXME cleanup needed for ret<0 ?
             return ret;
-
+        {PROFILE_START("av_interleaved_write_frame/write_packet")
         ret = write_packet(s, &opkt);
+        PROFILE_END}
         if (ret >= 0)
             s->streams[opkt.stream_index]->nb_frames++;
-
+        {PROFILE_START("av_interleaved_write_frame/av_packet_unref")
         av_packet_unref(&opkt);
+        PROFILE_END}
 
         if (ret < 0)
             return ret;
@@ -1241,6 +1264,7 @@ int av_interleaved_write_frame(AVFormatContext *s, AVPacket *pkt)
     }
 fail:
     av_packet_unref(pkt);
+    
     return ret;
 }
 

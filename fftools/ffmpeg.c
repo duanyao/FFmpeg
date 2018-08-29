@@ -63,6 +63,8 @@
 #include "libavutil/time.h"
 #include "libavutil/thread.h"
 #include "libavutil/threadmessage.h"
+#include "libavutil/uprofiler.h"
+//#include "libavutil/uprofiler.c"
 #include "libavcodec/mathops.h"
 #include "libavformat/os_support.h"
 
@@ -680,6 +682,7 @@ static void close_all_output_streams(OutputStream *ost, OSTFinished this_stream,
 
 static void write_packet(OutputFile *of, AVPacket *pkt, OutputStream *ost, int unqueue)
 {
+    PROFILE_START("write_packet");
     AVFormatContext *s = of->ctx;
     AVStream *st = ost->st;
     int ret;
@@ -804,13 +807,16 @@ static void write_packet(OutputFile *of, AVPacket *pkt, OutputStream *ost, int u
               );
     }
 
+    {PROFILE_START("write_packet/av_interleaved_write_frame");
     ret = av_interleaved_write_frame(s, pkt);
+    PROFILE_END}
     if (ret < 0) {
         print_error("av_interleaved_write_frame()", ret);
         main_return_code = 1;
         close_all_output_streams(ost, MUXER_FINISHED | ENCODER_FINISHED, ENCODER_FINISHED);
     }
     av_packet_unref(pkt);
+    PROFILE_END;
 }
 
 static void close_output_stream(OutputStream *ost)
@@ -838,6 +844,7 @@ static void close_output_stream(OutputStream *ost)
 static void output_packet(OutputFile *of, AVPacket *pkt,
                           OutputStream *ost, int eof)
 {
+    PROFILE_START("output_packet");
     int ret = 0;
 
     /* apply the output bitstream filters, if any */
@@ -884,6 +891,7 @@ finish:
         if(exit_on_error)
             exit_program(1);
     }
+    PROFILE_END;
 }
 
 static int check_recording_time(OutputStream *ost)
@@ -1414,6 +1422,7 @@ static void finish_output_stream(OutputStream *ost)
  */
 static int reap_filters(int flush)
 {
+    PROFILE_START("reap_filters");
     AVFrame *filtered_frame = NULL;
     int i;
 
@@ -1514,7 +1523,7 @@ static int reap_filters(int flush)
             av_frame_unref(filtered_frame);
         }
     }
-
+    PROFILE_END;
     return 0;
 }
 
@@ -1980,6 +1989,7 @@ static int check_output_constraints(InputStream *ist, OutputStream *ost)
 
 static void do_streamcopy(InputStream *ist, OutputStream *ost, const AVPacket *pkt)
 {
+    PROFILE_START("do_streamcopy");
     OutputFile *of = output_files[ost->file_index];
     InputFile   *f = input_files [ist->file_index];
     int64_t start_time = (of->start_time == AV_NOPTS_VALUE) ? 0 : of->start_time;
@@ -2078,6 +2088,7 @@ static void do_streamcopy(InputStream *ist, OutputStream *ost, const AVPacket *p
     av_copy_packet_side_data(&opkt, pkt);
 
     output_packet(of, &opkt, ost, 0);
+    PROFILE_END;
 }
 
 int guess_input_channel_layout(InputStream *ist)
@@ -2574,6 +2585,7 @@ static int send_filter_eof(InputStream *ist)
 /* pkt = NULL means EOF (needed to flush decoder buffers) */
 static int process_input_packet(InputStream *ist, const AVPacket *pkt, int no_eof)
 {
+    PROFILE_START("process_input_packet");
     int ret = 0, i;
     int repeating = 0;
     int eof_reached = 0;
@@ -2611,6 +2623,7 @@ static int process_input_packet(InputStream *ist, const AVPacket *pkt, int no_eo
 
     // while we have more to decode or while the decoder did output something on EOF
     while (ist->decoding_needed) {
+        PROFILE_START("process_input_packet/decoding_needed");
         int64_t duration_dts = 0;
         int64_t duration_pts = 0;
         int got_output = 0;
@@ -2697,6 +2710,8 @@ static int process_input_packet(InputStream *ist, const AVPacket *pkt, int no_eo
         if (!pkt)
             break;
 
+        PROFILE_END;
+
         repeating = 1;
     }
 
@@ -2712,6 +2727,7 @@ static int process_input_packet(InputStream *ist, const AVPacket *pkt, int no_eo
 
     /* handle stream copy */
     if (!ist->decoding_needed && pkt) {
+        PROFILE_START("process_input_packet/!decoding_needed");
         ist->dts = ist->next_dts;
         switch (ist->dec_ctx->codec_type) {
         case AVMEDIA_TYPE_AUDIO:
@@ -2736,15 +2752,19 @@ static int process_input_packet(InputStream *ist, const AVPacket *pkt, int no_eo
         }
         ist->pts = ist->dts;
         ist->next_pts = ist->next_dts;
+        PROFILE_END;
     }
     for (i = 0; i < nb_output_streams; i++) {
+        PROFILE_START("process_input_packet/do_streamcopy");
         OutputStream *ost = output_streams[i];
 
         if (!check_output_constraints(ist, ost) || ost->encoding_needed)
             continue;
 
         do_streamcopy(ist, ost, pkt);
+        PROFILE_END;
     }
+    PROFILE_END;
 
     return !eof_reached;
 }
@@ -4222,6 +4242,7 @@ static int seek_to_start(InputFile *ifile, AVFormatContext *is)
  */
 static int process_input(int file_index)
 {
+    PROFILE_START("process_input");
     InputFile *ifile = input_files[file_index];
     AVFormatContext *is;
     InputStream *ist;
@@ -4235,6 +4256,7 @@ static int process_input(int file_index)
 
     if (ret == AVERROR(EAGAIN)) {
         ifile->eagain = 1;
+        PROFILE_END;
         return ret;
     }
     if (ret < 0 && ifile->loop) {
@@ -4244,8 +4266,10 @@ static int process_input(int file_index)
             avctx = ist->dec_ctx;
             if (ist->decoding_needed) {
                 ret = process_input_packet(ist, NULL, 1);
-                if (ret>0)
+                if (ret>0) {
+                    PROFILE_END;
                     return 0;
+                }
                 avcodec_flush_buffers(avctx);
             }
         }
@@ -4256,6 +4280,7 @@ static int process_input(int file_index)
             ret = get_input_packet(ifile, &pkt);
         if (ret == AVERROR(EAGAIN)) {
             ifile->eagain = 1;
+            PROFILE_END;
             return ret;
         }
     }
@@ -4270,8 +4295,10 @@ static int process_input(int file_index)
             ist = input_streams[ifile->ist_index + i];
             if (ist->decoding_needed) {
                 ret = process_input_packet(ist, NULL, 0);
-                if (ret>0)
+                if (ret>0) {
+                    PROFILE_END;
                     return 0;
+                }
             }
 
             /* mark all outputs that don't go through lavfi as finished */
@@ -4285,6 +4312,7 @@ static int process_input(int file_index)
         }
 
         ifile->eof_reached = 1;
+        PROFILE_END;
         return AVERROR(EAGAIN);
     }
 
@@ -4474,6 +4502,8 @@ static int process_input(int file_index)
 discard_packet:
     av_packet_unref(&pkt);
 
+    PROFILE_END;
+
     return 0;
 }
 
@@ -4486,6 +4516,7 @@ discard_packet:
  */
 static int transcode_from_filter(FilterGraph *graph, InputStream **best_ist)
 {
+    PROFILE_START("transcode_from_filter");
     int i, ret;
     int nb_requests, nb_requests_max = 0;
     InputFilter *ifilter;
@@ -4521,7 +4552,7 @@ static int transcode_from_filter(FilterGraph *graph, InputStream **best_ist)
     if (!*best_ist)
         for (i = 0; i < graph->nb_outputs; i++)
             graph->outputs[i]->ost->unavailable = 1;
-
+    PROFILE_END;
     return 0;
 }
 
@@ -4532,6 +4563,7 @@ static int transcode_from_filter(FilterGraph *graph, InputStream **best_ist)
  */
 static int transcode_step(void)
 {
+    PROFILE_START("transcode_step");
     OutputStream *ost;
     InputStream  *ist = NULL;
     int ret;
@@ -4540,7 +4572,13 @@ static int transcode_step(void)
     if (!ost) {
         if (got_eagain()) {
             reset_eagain();
-            av_usleep(10000);
+            {
+                PROFILE_START("transcode_step/sleep");
+                //av_usleep(10000);
+                av_usleep(1000);
+                PROFILE_END;
+            }
+            PROFILE_END;
             return 0;
         }
         av_log(NULL, AV_LOG_VERBOSE, "No more inputs to read from, finishing.\n");
@@ -4582,6 +4620,7 @@ static int transcode_step(void)
         }
         if (!ist) {
             ost->inputs_done = 1;
+            PROFILE_END;
             return 0;
         }
     } else {
@@ -4593,13 +4632,16 @@ static int transcode_step(void)
     if (ret == AVERROR(EAGAIN)) {
         if (input_files[ist->file_index]->eagain)
             ost->unavailable = 1;
+        PROFILE_END;
         return 0;
     }
 
     if (ret < 0)
         return ret == AVERROR_EOF ? 0 : ret;
 
-    return reap_filters(0);
+    ret = reap_filters(0);
+    PROFILE_END;
+    return ret;
 }
 
 /*
@@ -4607,6 +4649,7 @@ static int transcode_step(void)
  */
 static int transcode(void)
 {
+    PROFILE_START("transcode");
     int ret, i;
     AVFormatContext *os;
     OutputStream *ost;
@@ -4630,6 +4673,7 @@ static int transcode(void)
 #endif
 
     while (!received_sigterm) {
+        PROFILE_START("transcode/loop");
         int64_t cur_time= av_gettime_relative();
 
         /* if 'q' pressed, exits */
@@ -4651,6 +4695,7 @@ static int transcode(void)
 
         /* dump report by using the output first video and audio streams */
         print_report(0, timer_start, cur_time);
+        PROFILE_END;
     }
 #if HAVE_THREADS
     free_input_threads();
@@ -4743,6 +4788,7 @@ static int transcode(void)
             }
         }
     }
+    PROFILE_END;
     return ret;
 }
 

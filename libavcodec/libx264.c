@@ -26,8 +26,10 @@
 #include "libavutil/pixdesc.h"
 #include "libavutil/stereo3d.h"
 #include "libavutil/intreadwrite.h"
+#include "libavutil/time.h"
 #include "avcodec.h"
 #include "internal.h"
+#include "libavutil/uprofiler.h"
 
 #if defined(_MSC_VER)
 #define X264_API_IMPORTS 1
@@ -271,6 +273,9 @@ static void reconfig_encoder(AVCodecContext *ctx, const AVFrame *frame)
 static int X264_frame(AVCodecContext *ctx, AVPacket *pkt, const AVFrame *frame,
                       int *got_packet)
 {
+    int64_t t0 = av_gettime();
+    av_log(ctx, AV_LOG_DEBUG, "<%.3f>X264_frame: start\n", t0 / 1000000.0);
+    PROFILE_START("X264_frame");
     X264Context *x4 = ctx->priv_data;
     x264_nal_t *nal;
     int nnal, i, ret;
@@ -382,6 +387,10 @@ FF_ENABLE_DEPRECATION_WARNINGS
     }
 
     *got_packet = ret;
+
+    PROFILE_END;
+    int64_t tEnd = av_gettime();
+    av_log(ctx, AV_LOG_DEBUG, "<%.3f>X264_frame: end, time_used:%.3f,\n", tEnd / 1000000.0, (tEnd - t0) / 1000000.0);
     return 0;
 }
 
