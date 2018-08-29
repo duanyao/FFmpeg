@@ -74,6 +74,7 @@ HEADERS = adler32.h                                                     \
           timestamp.h                                                   \
           tree.h                                                        \
           twofish.h                                                     \
+          uprofiler.h                                                   \
           version.h                                                     \
           xtea.h                                                        \
           tea.h                                                         \
@@ -150,6 +151,7 @@ OBJS = adler32.o                                                        \
        timecode.o                                                       \
        tree.o                                                           \
        twofish.o                                                        \
+       uprofiler.o                                                      \
        utils.o                                                          \
        xga_font_data.o                                                  \
        xtea.o                                                           \
